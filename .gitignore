@@ -2,6 +2,14 @@
 __pycache__/
 *.py[codz]
 *$py.class
+**.env
+**.nix
+**.lock
+**.tmuxp**
+**devenv**
+**direnv**
+.python-version
+.agent**
 
 # C extensions
 *.so
@@ -205,3 +213,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
