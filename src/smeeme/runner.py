@@ -1,7 +1,8 @@
-"""Core SmeeMe subprocess runner with threading-based monitoring."""
+"""Core SmeeMe subprocess runner with threading-based monitoring and embedded HTTP receiver."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -9,10 +10,22 @@ import shlex
 import subprocess
 import threading
 import time
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from shutil import which
 from typing import Any, Callable, Dict, List, Optional, Sequence
+from urllib.parse import urlparse
 
 import httpx
+
+try:
+    from rich.console import Console
+    from rich.json import JSON
+    from rich.panel import Panel
+    from rich.text import Text
+
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
 from .config import SmeeConfig
 from .exceptions import SmeeClientNotFoundError, SmeeProcessError, SmeeStartError
@@ -22,11 +35,84 @@ from .queue import SmeeQueue, QueueBackend
 logger = logging.getLogger(__name__)
 
 
-class SmeeMe:
-    """Main SmeeMe runner with subprocess management and optional queuing."""
+class WebhookHandler(BaseHTTPRequestHandler):
+    """HTTP handler for embedded webhook receiver."""
 
-    def __init__(self, config: SmeeConfig):
+    def __init__(self, smee_runner: SmeeMe, *args, **kwargs):
+        self.smee_runner = smee_runner
+        super().__init__(*args, **kwargs)
+
+    def do_POST(self):
+        """Handle POST requests to webhook endpoint."""
+        try:
+            # Parse path
+            path = urlparse(self.path).path
+            webhook_path = self.smee_runner.config.webhook_path
+
+            if path != webhook_path:
+                self.send_error(404, f"Not Found - Expected {webhook_path}")
+                return
+
+            # Read headers
+            headers = dict(self.headers)
+
+            # Read body
+            content_length = int(headers.get("content-length", 0))
+            body_bytes = self.rfile.read(content_length) if content_length > 0 else b""
+
+            # Parse body based on content type
+            content_type = headers.get("content-type", "")
+            if "application/json" in content_type:
+                try:
+                    body = json.loads(body_bytes.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    body = body_bytes.decode("utf-8", errors="replace")
+            else:
+                body = body_bytes.decode("utf-8", errors="replace")
+
+            # Create event
+            event = SmeeEvent(
+                timestamp=time.time(),
+                headers=headers,
+                body=body,
+                source_ip=self.client_address[0] if self.client_address else None,
+                receiver_port=self.server.server_port,
+            )
+
+            # Process event through SmeeMe pipeline
+            self.smee_runner._handle_webhook_event(event)
+
+            # Send success response
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "received", "timestamp": ' + str(event.timestamp).encode() + b"}")
+
+        except Exception as e:
+            logger.error(f"Webhook handler error: {e}")
+            self.send_error(500, f"Internal Server Error: {e}")
+
+    def do_GET(self):
+        """Handle GET requests for health checks."""
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "healthy", "receiver": "embedded"}')
+        else:
+            self.send_error(404, "Not Found")
+
+    def log_message(self, format: str, *args) -> None:
+        """Override to use our logger."""
+        logger.debug(f"[embedded-receiver] {format % args}")
+
+
+class SmeeMe:
+    """Main SmeeMe runner with subprocess management and embedded HTTP receiver."""
+
+    def __init__(self, config: SmeeConfig, verbose_logging: bool = False):
         self.config = config
+        self.verbose_logging = verbose_logging
         self._process: Optional[subprocess.Popen] = None
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
@@ -34,18 +120,30 @@ class SmeeMe:
         self._ready_pattern = re.compile(self.config.ready_pattern)
         self._start_time: Optional[float] = None
         self._metrics = SmeeMetrics()
-        self._status = SmeeStatus()
-        
+        self._status = SmeeStatus(running=False)
+
+        # Rich console for pretty output
+        self._console = Console() if RICH_AVAILABLE and verbose_logging else None
+
+        # Embedded HTTP receiver
+        self._http_server: Optional[ThreadingHTTPServer] = None
+        self._http_thread: Optional[threading.Thread] = None
+        self._actual_receiver_port: Optional[int] = None
+
+        # Event logging
+        self._log_lock = threading.Lock()
+
         # Event handlers
         self._event_handlers: List[Callable[[SmeeEvent], Any]] = []
-        
+
         # Queue setup
         self._queue: Optional[SmeeQueue] = None
         if self.config.enable_queue:
             self._setup_queue()
-        
-        # Setup logging
+
+        # Setup logging and event handlers
         self._setup_logging()
+        self._setup_event_handlers()
 
     def _setup_logging(self) -> None:
         """Configure logging based on config."""
@@ -69,6 +167,12 @@ class SmeeMe:
             logger.error(f"Failed to setup queue: {e}")
             raise
 
+    def _setup_event_handlers(self) -> None:
+        """Setup default event handlers."""
+        # Always add JSONL logging if configured
+        if self.config.event_log_path:
+            self.add_event_handler(self._log_event_to_jsonl)
+
     # Lifecycle management
     def __enter__(self) -> SmeeMe:
         """Context manager entry."""
@@ -80,12 +184,16 @@ class SmeeMe:
         self.stop()
 
     def start(self) -> None:
-        """Start the smee client subprocess."""
+        """Start the embedded receiver and smee client subprocess."""
         if self._process and self._process.poll() is None:
             logger.warning("SmeeMe already running")
             return
 
-        # Build command
+        # Start embedded HTTP receiver first
+        if self.config.embedded_receiver:
+            self._start_embedded_receiver()
+
+        # Build command pointing to embedded receiver or original target
         cmd = self._build_command()
         logger.info(f"{self.config.log_prefix} Starting: {' '.join(shlex.quote(c) for c in cmd)}")
 
@@ -110,10 +218,18 @@ class SmeeMe:
         # Start process
         try:
             self._process = subprocess.Popen(cmd, **popen_kwargs)
-            self._status = SmeeStatus(running=True, process_id=self._process.pid)
+            self._status = SmeeStatus(
+                running=True,
+                process_id=self._process.pid,
+                receiver_port=self._actual_receiver_port,
+                receiver_running=self._http_server is not None,
+            )
         except FileNotFoundError as e:
             raise SmeeClientNotFoundError(f"smee-client not found: {e}")
         except Exception as e:
+            self._status.last_error = str(e)
+            self._status.running = False
+            self._status.process_id = None
             raise SmeeStartError(f"Failed to start smee-client: {e}")
 
         # Start monitoring threads
@@ -146,10 +262,16 @@ class SmeeMe:
         if self._queue:
             self._queue.start_workers(self.config.queue_workers)
 
+        self._status.running = True
+        self._status.process_id = self._process.pid if self._process else None
+        self._status.last_error = None
+
         logger.info(f"{self.config.log_prefix} Started successfully (PID: {self._process.pid})")
+        if self._actual_receiver_port:
+            logger.info(f"{self.config.log_prefix} Embedded receiver on port {self._actual_receiver_port}")
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop the smee client subprocess."""
+        """Stop the smee client subprocess and embedded receiver."""
         if not self._process or self._process.poll() is not None:
             return
 
@@ -170,6 +292,9 @@ class SmeeMe:
         except Exception as e:
             logger.error(f"{self.config.log_prefix} Error stopping process: {e}")
 
+        # Stop embedded receiver
+        self._stop_embedded_receiver()
+
         # Update metrics
         if self._start_time:
             uptime = time.time() - self._start_time
@@ -178,6 +303,8 @@ class SmeeMe:
         # Clean up
         self._process = None
         self._status.running = False
+        self._status.process_id = None
+        self._status.receiver_running = False
         logger.info(f"{self.config.log_prefix} Stopped")
 
     def restart(self) -> None:
@@ -200,6 +327,8 @@ class SmeeMe:
             self._status.uptime_seconds = time.time() - self._start_time
             self._status.events_received = self._metrics.total_events
             self._status.events_forwarded = self._metrics.successful_events
+            self._status.receiver_port = self._actual_receiver_port
+            self._status.receiver_running = self._http_server is not None
             if self._queue:
                 self._status.queue_size = self._queue.backend.size()
 
@@ -208,6 +337,46 @@ class SmeeMe:
     def get_metrics(self) -> SmeeMetrics:
         """Get current metrics."""
         return self._metrics.model_copy()
+
+    # Embedded HTTP receiver
+    def _start_embedded_receiver(self) -> None:
+        """Start embedded HTTP receiver."""
+        try:
+            # Create handler class with reference to self
+            def handler_factory(*args, **kwargs):
+                return WebhookHandler(self, *args, **kwargs)
+
+            # Create server
+            self._http_server = ThreadingHTTPServer((self.config.listen_host, self.config.listen_port), handler_factory)
+
+            # Get actual port if auto-assigned
+            self._actual_receiver_port = self._http_server.server_port
+
+            # Start server in background thread
+            self._http_thread = threading.Thread(
+                target=self._http_server.serve_forever, daemon=True, name="embedded-receiver"
+            )
+            self._http_thread.start()
+
+            logger.info(
+                f"{self.config.log_prefix} Embedded receiver started on {self.config.listen_host}:{self._actual_receiver_port}"
+            )
+
+        except Exception as e:
+            logger.error(f"{self.config.log_prefix} Failed to start embedded receiver: {e}")
+            raise SmeeStartError(f"Failed to start embedded HTTP receiver: {e}")
+
+    def _stop_embedded_receiver(self) -> None:
+        """Stop embedded HTTP receiver."""
+        if self._http_server:
+            logger.info(f"{self.config.log_prefix} Stopping embedded receiver...")
+            self._http_server.shutdown()
+            if self._http_thread and self._http_thread.is_alive():
+                self._http_thread.join(timeout=5.0)
+            self._http_server = None
+            self._http_thread = None
+            self._actual_receiver_port = None
+            logger.info(f"{self.config.log_prefix} Embedded receiver stopped")
 
     # Event handling
     def add_event_handler(self, handler: Callable[[SmeeEvent], Any]) -> None:
@@ -224,6 +393,155 @@ class SmeeMe:
         if not self._queue:
             raise ValueError("Queue not enabled. Set enable_queue=True in config")
         self._queue.register_workflow(workflow_type, handler)
+
+    def _handle_webhook_event(self, event: SmeeEvent) -> None:
+        """Handle incoming webhook event (tee mode: log + forward + queue)."""
+        self._metrics.total_events += 1
+        event_success = True
+
+        try:
+            # Call direct handlers (including JSONL logging)
+            for handler in self._event_handlers:
+                try:
+                    handler(event)
+                except Exception as e:
+                    logger.error(f"Event handler error: {e}")
+                    event_success = False
+
+            # Forward to original target if configured
+            if self.config.target and self.config.target.strip():
+                try:
+                    self._forward_to_target(event)
+                except Exception as e:
+                    logger.error(f"Failed to forward event to {self.config.target}: {e}")
+                    event_success = False
+
+            # Queue processing if enabled
+            if self._queue:
+                try:
+                    job = self._queue.enqueue_event(event)
+                    logger.debug(f"Enqueued event as job {job.job_id}")
+                except Exception as e:
+                    logger.error(f"Queue processing failed: {e}")
+                    event_success = False
+
+            if event_success:
+                self._metrics.successful_events += 1
+            else:
+                self._metrics.failed_events += 1
+
+        except Exception as e:
+            logger.error(f"Error handling webhook event: {e}")
+            self._metrics.failed_events += 1
+            self._status.last_error = str(e)
+
+    def _forward_to_target(self, event: SmeeEvent) -> None:
+        """Forward event to original target URL."""
+        try:
+            # Prepare request
+            target_url = self.config.effective_target
+            headers = event.headers.copy()
+
+            # Remove hop-by-hop headers
+            hop_by_hop = {
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "transfer-encoding",
+                "upgrade",
+            }
+            headers = {k: v for k, v in headers.items() if k.lower() not in hop_by_hop}
+
+            # Prepare body
+            if isinstance(event.body, dict):
+                data = json.dumps(event.body)
+                headers["content-type"] = "application/json"
+            else:
+                data = event.body
+
+            # Forward request
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(target_url, content=data, headers=headers)
+
+                if 200 <= response.status_code < 300:
+                    self._metrics.events_forwarded_to_target += 1
+                    event.forwarded = True
+                    logger.debug(f"Forwarded event to {target_url} -> {response.status_code}")
+                else:
+                    event.error = f"Target returned {response.status_code}"
+                    logger.warning(f"Target {target_url} returned {response.status_code}")
+
+        except Exception as e:
+            event.error = str(e)
+            logger.error(f"Failed to forward event to {self.config.effective_target}: {e}")
+
+    def _log_event_to_jsonl(self, event: SmeeEvent) -> None:
+        """Log event to JSONL file with thread safety."""
+        if not self.config.event_log_path:
+            return
+
+        try:
+            with self._log_lock:
+                with open(self.config.event_log_path, "a", encoding="utf-8") as f:
+                    json_line = event.model_dump_json(exclude_none=True)
+                    f.write(json_line + "\n")
+                    f.flush()
+
+                self._metrics.events_logged += 1
+                logger.debug(f"Logged event to {self.config.event_log_path}")
+
+                # Rich pretty logging if enabled
+                if self._console:
+                    self._rich_log_event(event)
+
+        except Exception as e:
+            logger.error(f"Failed to log event to {self.config.event_log_path}: {e}")
+
+    def _rich_log_event(self, event: SmeeEvent) -> None:
+        """Log event with Rich formatting."""
+        if not self._console:
+            return
+
+        # Create status indicators
+        status_icons = []
+        if event.forwarded:
+            status_icons.append("📤 Forwarded")
+        if event.error:
+            status_icons.append("❌ Error")
+        if not self.config.target:
+            status_icons.append("📝 Logged")
+
+        status_text = " | ".join(status_icons) if status_icons else "📥 Received"
+
+        # Format event data
+        if isinstance(event.body, dict):
+            body_preview = json.dumps(event.body, indent=2, ensure_ascii=False)
+        elif isinstance(event.body, str) and len(event.body) < 200:
+            body_preview = event.body
+        else:
+            body_preview = f"[{type(event.body).__name__}] {len(str(event.body))} chars"
+
+        # Create panel
+        panel_content = f"""
+{status_text}
+Source: {event.source_ip or "unknown"}
+User-Agent: {event.user_agent or "none"}
+Content-Type: {event.content_type or "none"}
+
+{body_preview}"""
+
+        panel = Panel(
+            panel_content.strip(),
+            title=f"Webhook Event - Port {event.receiver_port}",
+            title_align="left",
+            border_style="green" if not event.error else "red",
+            width=80,
+        )
+
+        self._console.print(panel)
 
     # Testing utilities
     def send_test_event(
@@ -254,15 +572,26 @@ class SmeeMe:
 
     # Internal methods
     def _build_command(self) -> Sequence[str]:
-        """Build smee client command."""
+        """Build smee client command pointing to embedded receiver."""
         client_mode = self._detect_client_mode()
-        
+
+        # Determine target - use embedded receiver if available, otherwise original target
+        if self.config.embedded_receiver and self._actual_receiver_port:
+            target_url = f"http://{self.config.listen_host}:{self._actual_receiver_port}{self.config.webhook_path}"
+        else:
+            target_url = self.config.effective_target
+
         if client_mode == "smee":
-            cmd = ["smee", "--url", self.config.url, "--target", self.config.effective_target]
+            cmd = ["smee", "--url", self.config.url, "--target", target_url]
         elif client_mode == "npx":
             cmd = [
-                "npx", "--yes", "smee-client@latest",
-                "--url", self.config.url, "--target", self.config.effective_target
+                "npx",
+                "--yes",
+                "smee-client@latest",
+                "--url",
+                self.config.url,
+                "--target",
+                target_url,
             ]
         else:
             raise SmeeClientNotFoundError("No suitable smee client found")
@@ -299,16 +628,16 @@ class SmeeMe:
             for line in iter(stream.readline, ""):
                 if not line:
                     break
-                
+
                 line = line.rstrip("\r\n")
                 if line:
                     logger.log(level, f"{self.config.log_prefix} {line}")
-                    
+
                     # Check for readiness
                     if not self._ready_event.is_set() and self._ready_pattern.search(line):
                         self._ready_event.set()
                         logger.info(f"{self.config.log_prefix} Ready!")
-                    
+
                     # Process as potential event
                     self._process_line(line)
         except Exception as e:
@@ -325,29 +654,3 @@ class SmeeMe:
         # forwards webhooks to the target URL, not via stdout
         # This method is here for potential future event interception
         pass
-
-    def _handle_webhook_event(self, event: SmeeEvent) -> None:
-        """Handle incoming webhook event."""
-        self._metrics.total_events += 1
-        
-        try:
-            # Queue processing if enabled
-            if self._queue:
-                job = self._queue.enqueue_event(event)
-                logger.debug(f"Enqueued event as job {job.job_id}")
-            
-            # Call direct handlers
-            for handler in self._event_handlers:
-                try:
-                    handler(event)
-                except Exception as e:
-                    logger.error(f"Event handler error: {e}")
-                    self._metrics.failed_events += 1
-                    return
-            
-            self._metrics.successful_events += 1
-            
-        except Exception as e:
-            logger.error(f"Error handling webhook event: {e}")
-            self._metrics.failed_events += 1
-            self._status.last_error = str(e)

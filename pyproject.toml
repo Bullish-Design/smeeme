@@ -50,7 +50,7 @@ smeeme = "smeeme.cli:main"
 line-length = 120
 target-version = "py311"
 lint.select = ["E","F","I","W","UP","B"]
-lint.ignore = ["E501"]
+lint.ignore = ["E501", "W293"]
 
 [tool.mypy]
 python_version = "3.11"

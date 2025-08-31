@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional, Type, TypeVar
 
 from .exceptions import SmeeConfigError
@@ -44,6 +45,13 @@ def _as_float(value: str | float | None, default: float) -> float:
         return default
 
 
+def _as_path(value: str | None) -> Optional[Path]:
+    """Convert string to Path if not None."""
+    if value is None:
+        return None
+    return Path(str(value).strip())
+
+
 class ConfigLoader:
     """Configuration loader with environment variable support."""
 
@@ -71,6 +79,10 @@ class ConfigLoader:
             f"{self.prefix}_LOG_PREFIX": "log_prefix",
             f"{self.prefix}_CAPTURE_STDOUT": "capture_stdout",
             f"{self.prefix}_CAPTURE_STDERR": "capture_stderr",
+            f"{self.prefix}_EMBEDDED_RECEIVER": "embedded_receiver",
+            f"{self.prefix}_LISTEN_HOST": "listen_host",
+            f"{self.prefix}_LISTEN_PORT": "listen_port",
+            f"{self.prefix}_EVENT_LOG_PATH": "event_log_path",
             f"{self.prefix}_ENABLE_QUEUE": "enable_queue",
             f"{self.prefix}_QUEUE_BACKEND": "queue_backend",
             f"{self.prefix}_QUEUE_WORKERS": "queue_workers",
@@ -92,6 +104,7 @@ class ConfigLoader:
         if env_vars_key in env and env[env_vars_key]:
             try:
                 import json
+
                 config_data["environment"] = json.loads(env[env_vars_key])
             except json.JSONDecodeError as e:
                 raise SmeeConfigError(f"Invalid JSON in {env_vars_key}: {e}")
@@ -107,6 +120,9 @@ class ConfigLoader:
             "start_timeout_s": lambda v: _as_float(v, 15.0),
             "capture_stdout": lambda v: _as_bool(v, True),
             "capture_stderr": lambda v: _as_bool(v, True),
+            "embedded_receiver": lambda v: _as_bool(v, True),
+            "listen_port": lambda v: _as_int(v, 0),
+            "event_log_path": lambda v: _as_path(v),
             "enable_queue": lambda v: _as_bool(v, False),
             "queue_workers": lambda v: _as_int(v, 3),
             "client_mode": lambda v: SmeeClientMode(v.lower()),
@@ -138,11 +154,18 @@ class ConfigValidator:
         elif not config.url.startswith("https://smee.io/"):
             errors.append("URL must be a valid smee.io channel URL")
 
-        # Target validation
-        if not config.target:
-            errors.append("Target URL is required")
-        elif not any(config.target.startswith(proto) for proto in ["http://", "https://"]):
+        # Target validation - only required if embedded receiver is disabled
+        if not config.embedded_receiver and not config.target:
+            errors.append("Target URL is required when embedded receiver is disabled")
+        elif config.target and not any(config.target.startswith(proto) for proto in ["http://", "https://"]):
             errors.append("Target must be a valid HTTP/HTTPS URL")
+
+        # Embedded receiver validation
+        if config.embedded_receiver:
+            if config.listen_port < 0 or config.listen_port > 65535:
+                errors.append("Listen port must be between 0-65535")
+            if config.event_log_path and not config.event_log_path.parent.exists():
+                errors.append(f"Event log directory does not exist: {config.event_log_path.parent}")
 
         # Queue validation
         if config.enable_queue:
@@ -171,6 +194,7 @@ class ConfigValidator:
         if config.enable_queue and config.queue_backend == QueueBackend.REDIS:
             try:
                 import redis
+
                 client = redis.from_url(config.redis_url, socket_connect_timeout=1)
                 client.ping()
             except ImportError:
@@ -181,6 +205,16 @@ class ConfigValidator:
         # Check system resources for queue workers
         if config.enable_queue and config.queue_workers > 10:
             warnings.append(f"High worker count ({config.queue_workers}) may consume significant resources")
+
+        # Check event log path permissions
+        if config.event_log_path:
+            try:
+                # Test write permissions
+                config.event_log_path.touch()
+            except PermissionError:
+                warnings.append(f"No write permission for event log: {config.event_log_path}")
+            except Exception as e:
+                warnings.append(f"Cannot access event log path: {e}")
 
         return warnings
 
@@ -205,8 +239,10 @@ def create_dev_config(
     url: str,
     target: str = "http://localhost:8000/webhook",
     enable_queue: bool = False,
+    event_log_path: Optional[str] = None,
 ) -> SmeeConfig:
     """Create a development configuration."""
+    log_path = Path(event_log_path) if event_log_path else None
     return SmeeConfig(
         url=url,
         target=target,
@@ -215,6 +251,8 @@ def create_dev_config(
         queue_workers=2,
         capture_stdout=True,
         capture_stderr=True,
+        embedded_receiver=True,
+        event_log_path=log_path,
     )
 
 
@@ -223,8 +261,10 @@ def create_production_config(
     target: str,
     redis_url: str = "redis://localhost:6379",
     workers: int = 5,
+    event_log_path: Optional[str] = None,
 ) -> SmeeConfig:
     """Create a production configuration with queue enabled."""
+    log_path = Path(event_log_path) if event_log_path else None
     return SmeeConfig(
         url=url,
         target=target,
@@ -235,4 +275,6 @@ def create_production_config(
         redis_url=redis_url,
         capture_stdout=True,
         capture_stderr=False,
+        embedded_receiver=True,
+        event_log_path=log_path,
     )

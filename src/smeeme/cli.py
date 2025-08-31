@@ -1,257 +1,379 @@
 #!/usr/bin/env python3
-"""Command line interface for SmeeMe."""
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "pydantic>=2.7",
-#     "httpx>=0.27",
-# ]
-# ///
+"""Typer-based CLI for SmeeMe.
+
+- Uses Enum for choice-like options (Typer/Click friendly)
+- Root & subcommands: no_args_is_help=True
+- Config = env (via load_config_from_env) + CLI overrides
+"""
 
 from __future__ import annotations
 
-import argparse
 import logging
 import sys
 import time
+from enum import Enum
+from pathlib import Path
 from typing import Optional
 
-from .config import SmeeConfig, load_config_from_env, create_dev_config
+import typer
+
+from .config import SmeeConfig, load_config_from_env
 from .exceptions import SmeeError
 from .runner import SmeeMe
 
-
-def create_parser() -> argparse.ArgumentParser:
-    """Create argument parser."""
-    parser = argparse.ArgumentParser(
-        prog="smeeme",
-        description="Pythonic wrapper for smee.io client with queue-based workflow processing"
-    )
-    
-    parser.add_argument("--url", help="smee.io channel URL")
-    parser.add_argument("--target", help="Target webhook URL")
-    parser.add_argument("--path", help="Path for webhook forwarding")
-    parser.add_argument("--client-mode", choices=["auto", "smee", "npx"], default="auto")
-    parser.add_argument("--start-timeout", type=float, default=15.0, help="Startup timeout in seconds")
-    parser.add_argument("--enable-queue", action="store_true", help="Enable workflow queue")
-    parser.add_argument("--queue-backend", choices=["memory", "redis"], default="memory")
-    parser.add_argument("--queue-workers", type=int, default=3, help="Number of queue workers")
-    parser.add_argument("--redis-url", default="redis://localhost:6379", help="Redis URL")
-    parser.add_argument("--verbose", "-v", action="count", default=0, help="Increase verbosity")
-    
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
-    # Start command
-    start_parser = subparsers.add_parser("start", help="Start SmeeMe client")
-    start_parser.add_argument("url", nargs="?", help="smee.io channel URL")
-    start_parser.add_argument("target", nargs="?", help="Target webhook URL")
-    
-    # Test command
-    test_parser = subparsers.add_parser("test", help="Send test event")
-    test_parser.add_argument("url", nargs="?", help="smee.io channel URL")
-    
-    # Status command
-    subparsers.add_parser("status", help="Show status")
-    
-    # Config command
-    config_parser = subparsers.add_parser("config", help="Show configuration")
-    config_parser.add_argument("--validate", action="store_true", help="Validate configuration")
-    
-    return parser
+# --------------------------- enums (choices) ---------------------------
 
 
-def setup_logging(verbose: int) -> None:
-    """Setup logging based on verbosity."""
+class ClientMode(str, Enum):
+    auto = "auto"
+    smee = "smee"
+    npx = "npx"
+
+
+class QueueBackend(str, Enum):
+    memory = "memory"
+    redis = "redis"
+
+
+# --------------------------- app ---------------------------
+
+app = typer.Typer(
+    name="smeeme",
+    help="Wrapper around smee.io client with embedded receiver and optional workflow queue",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+# --------------------------- helpers ---------------------------
+
+
+def _setup_logging(verbose: int) -> None:
     levels = [logging.WARNING, logging.INFO, logging.DEBUG]
     level = levels[min(verbose, len(levels) - 1)]
-    
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%H:%M:%S",
     )
 
 
-def load_configuration(args: argparse.Namespace) -> SmeeConfig:
-    """Load configuration from environment and arguments."""
-    # Start with environment
+def _enum_val(x):
+    return getattr(x, "value", x)
+
+
+def _build_config_from_options(
+    *,
+    url: Optional[str],
+    target: Optional[str],
+    path: Optional[str],
+    client_mode: Optional[ClientMode],
+    start_timeout: Optional[float],
+    embedded_receiver: Optional[bool],
+    listen_host: Optional[str],
+    listen_port: Optional[int],
+    event_log_path: Optional[Path],
+    enable_queue: Optional[bool],
+    queue_backend: Optional[QueueBackend],
+    queue_workers: Optional[int],
+    redis_url: Optional[str],
+) -> SmeeConfig:
+    # Load from env (tolerate partial env), then apply CLI overrides.
     try:
-        config = load_config_from_env(validate=False)
+        cfg = load_config_from_env(validate=False)  # type: ignore[arg-type]
     except Exception:
-        # Fallback to defaults if env loading fails
-        config = SmeeConfig(url="", target="")
-    
-    # Override with command line arguments
-    overrides = {}
-    
-    if args.url:
-        overrides["url"] = args.url
-    if args.target:
-        overrides["target"] = args.target
-    if args.path:
-        overrides["path"] = args.path
-    if args.client_mode != "auto":
-        overrides["client_mode"] = args.client_mode
-    if args.start_timeout != 15.0:
-        overrides["start_timeout_s"] = args.start_timeout
-    if args.enable_queue:
-        overrides["enable_queue"] = True
-    if args.queue_backend != "memory":
-        overrides["queue_backend"] = args.queue_backend
-    if args.queue_workers != 3:
-        overrides["queue_workers"] = args.queue_workers
-    if args.redis_url != "redis://localhost:6379":
-        overrides["redis_url"] = args.redis_url
-    
-    # Create new config with overrides
-    if overrides:
-        config_data = config.model_dump()
-        config_data.update(overrides)
-        config = SmeeConfig(**config_data)
-    
-    return config
+        # Default config with empty target (embedded receiver mode)
+        cfg = SmeeConfig(url="", target="")
+
+    # Pydantic v2 (model_dump) / v1 (dict) compatibility
+    dump = cfg.model_dump() if hasattr(cfg, "model_dump") else cfg.dict()
+
+    def set_if(key: str, value):
+        if value is not None:
+            dump[key] = _enum_val(value)
+
+    set_if("url", url)
+    set_if("target", target or "")  # Default to empty string
+    set_if("path", path)
+    set_if("client_mode", client_mode)
+    if start_timeout is not None:
+        dump["start_timeout_s"] = start_timeout
+    if embedded_receiver is not None:
+        dump["embedded_receiver"] = embedded_receiver
+    set_if("listen_host", listen_host)
+    set_if("listen_port", listen_port)
+    set_if("event_log_path", event_log_path)
+    if enable_queue is not None:
+        dump["enable_queue"] = enable_queue
+    set_if("queue_backend", queue_backend)
+    set_if("queue_workers", queue_workers)
+    set_if("redis_url", redis_url)
+
+    return SmeeConfig(**dump)
 
 
-def cmd_start(args: argparse.Namespace, config: SmeeConfig) -> int:
-    """Start SmeeMe client."""
-    # Handle positional arguments
-    if args.url:
-        config_data = config.model_dump()
-        config_data["url"] = args.url
-        if args.target:
-            config_data["target"] = args.target
-        config = SmeeConfig(**config_data)
-    
-    if not config.url or not config.target:
-        print("Error: URL and target are required", file=sys.stderr)
-        print("Set SMEEME_URL and SMEEME_TARGET environment variables,")
-        print("or provide them as arguments: smeeme start <url> <target>")
-        return 1
-    
-    print(f"Starting SmeeMe...")
-    print(f"Channel: {config.channel_id}")
-    print(f"Target: {config.effective_target}")
-    if config.enable_queue:
-        print(f"Queue: {config.queue_backend.value} ({config.queue_workers} workers)")
-    
+def _print_cfg_summary(cfg: SmeeConfig) -> None:
+    channel = getattr(cfg, "channel_id", None) or getattr(cfg, "url", "")
+    eff_target = getattr(cfg, "effective_target", None) or getattr(cfg, "target", "")
+    typer.echo(f"Channel: {channel}")
+    typer.echo(f"Target:  {eff_target}")
+
+    # Show embedded receiver info
+    if getattr(cfg, "embedded_receiver", True):
+        host = getattr(cfg, "listen_host", "127.0.0.1")
+        port = getattr(cfg, "listen_port", 0)
+        port_info = "auto" if port == 0 else str(port)
+        typer.echo(f"Receiver: {host}:{port_info}")
+
+        log_path = getattr(cfg, "event_log_path", None)
+        if log_path:
+            typer.echo(f"Event log: {log_path}")
+
+    if getattr(cfg, "enable_queue", False):
+        qb = getattr(cfg, "queue_backend", None)
+        qb_val = getattr(qb, "value", qb)
+        workers = getattr(cfg, "queue_workers", None)
+        typer.echo(f"Queue:   {qb_val} ({workers} workers)")
+
+
+# --------------------------- commands ---------------------------
+
+
+@app.command(no_args_is_help=True)
+def start(
+    url: Optional[str] = typer.Option(None, "--url", help="smee.io channel URL"),
+    target: Optional[str] = typer.Option(None, "--target", help="Target webhook URL"),
+    path: Optional[str] = typer.Option(None, "--path", help="Path appended to target"),
+    client_mode: Optional[ClientMode] = typer.Option(None, "--client-mode", help="auto|smee|npx"),
+    start_timeout: Optional[float] = typer.Option(None, "--start-timeout", help="Startup timeout (seconds)"),
+    embedded_receiver: Optional[bool] = typer.Option(
+        None, "--embedded-receiver/--no-embedded-receiver", help="Enable embedded HTTP receiver"
+    ),
+    listen_host: Optional[str] = typer.Option(None, "--listen-host", help="Embedded receiver host"),
+    listen_port: Optional[int] = typer.Option(None, "--listen-port", help="Embedded receiver port (0=auto)"),
+    event_log_path: Optional[Path] = typer.Option(None, "--event-log-path", help="Path to log events as JSONL"),
+    enable_queue: Optional[bool] = typer.Option(None, "--enable-queue/--no-enable-queue", help="Enable workflow queue"),
+    queue_backend: Optional[QueueBackend] = typer.Option(None, "--queue-backend", help="memory|redis"),
+    queue_workers: Optional[int] = typer.Option(None, "--queue-workers", help="Number of queue workers"),
+    redis_url: Optional[str] = typer.Option(None, "--redis-url", help="Redis URL (if queue-backend=redis)"),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity"),
+):
+    """Start the Smee client with embedded receiver and block until Ctrl+C."""
+    _setup_logging(verbose)
+    cfg = _build_config_from_options(
+        url=url,
+        target=target,
+        path=path,
+        client_mode=client_mode,
+        start_timeout=start_timeout,
+        embedded_receiver=embedded_receiver,
+        listen_host=listen_host,
+        listen_port=listen_port,
+        event_log_path=event_log_path,
+        enable_queue=enable_queue,
+        queue_backend=queue_backend,
+        queue_workers=queue_workers,
+        redis_url=redis_url,
+    )
+
+    if not getattr(cfg, "url", ""):
+        typer.secho("URL is required (SMEEME_URL or --url).", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    # Target only required if embedded receiver is disabled
+    if not getattr(cfg, "embedded_receiver", True) and not getattr(cfg, "target", ""):
+        typer.secho("Target is required when embedded receiver is disabled.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    typer.echo("Starting SmeeMe…")
+    _print_cfg_summary(cfg)
+
     try:
-        with SmeeMe(config) as smee:
-            print("SmeeMe running. Press Ctrl+C to stop.")
-            try:
-                while True:
-                    time.sleep(1.0)
-                    # Print status every 30 seconds
-                    if int(time.time()) % 30 == 0:
-                        status = smee.get_status()
-                        print(f"Status: {status.events_received} events received, "
-                              f"{status.events_forwarded} forwarded")
-            except KeyboardInterrupt:
-                print("\nStopping SmeeMe...")
+        with SmeeMe(cfg, verbose_logging=verbose > 0) as smee:
+            typer.echo("SmeeMe running. Press Ctrl+C to stop.")
+            last = 0
+            while True:
+                time.sleep(1.0)
+                now = int(time.time())
+                if now // 30 != last // 30:
+                    last = now
+                    st = smee.get_status()
+                    recv = getattr(st, "events_received", None) or getattr(st, "received", 0)
+                    fwd = getattr(st, "events_forwarded", None) or getattr(st, "forwarded", 0)
+                    up = int(getattr(st, "uptime_seconds", 0))
+                    port = getattr(st, "receiver_port", None)
+                    port_info = f" receiver_port={port}" if port else ""
+                    typer.echo(f"Status: received={recv} forwarded={fwd} uptime_s={up}{port_info}")
+    except KeyboardInterrupt:
+        typer.echo("\nStopping SmeeMe…")
     except SmeeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        typer.secho(f"Error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
     except Exception as e:
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        return 2
-    
-    return 0
+        typer.secho(f"Unexpected error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2)
 
 
-def cmd_test(args: argparse.Namespace, config: SmeeConfig) -> int:
-    """Send test event."""
-    if args.url:
-        config_data = config.model_dump()
-        config_data["url"] = args.url
-        config = SmeeConfig(**config_data)
-    
-    if not config.url:
-        print("Error: URL is required", file=sys.stderr)
-        return 1
-    
-    print(f"Sending test event to {config.channel_id}...")
-    
+@app.command(no_args_is_help=True)
+def test(
+    url: Optional[str] = typer.Option(None, "--url", help="smee.io channel URL"),
+    target: Optional[str] = typer.Option(None, "--target", help="Target webhook URL"),
+    path: Optional[str] = typer.Option(None, "--path", help="Path appended to target"),
+    client_mode: Optional[ClientMode] = typer.Option(None, "--client-mode", help="auto|smee|npx"),
+    start_timeout: Optional[float] = typer.Option(None, "--start-timeout", help="Startup timeout (seconds)"),
+    embedded_receiver: Optional[bool] = typer.Option(
+        None, "--embedded-receiver/--no-embedded-receiver", help="Enable embedded HTTP receiver"
+    ),
+    listen_host: Optional[str] = typer.Option(None, "--listen-host", help="Embedded receiver host"),
+    listen_port: Optional[int] = typer.Option(None, "--listen-port", help="Embedded receiver port (0=auto)"),
+    event_log_path: Optional[Path] = typer.Option(None, "--event-log-path", help="Path to log events as JSONL"),
+    enable_queue: Optional[bool] = typer.Option(None, "--enable-queue/--no-enable-queue", help="Enable workflow queue"),
+    queue_backend: Optional[QueueBackend] = typer.Option(None, "--queue-backend", help="memory|redis"),
+    queue_workers: Optional[int] = typer.Option(None, "--queue-workers", help="Number of queue workers"),
+    redis_url: Optional[str] = typer.Option(None, "--redis-url", help="Redis URL (if queue-backend=redis)"),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity"),
+):
+    """Send a test event to the channel."""
+    _setup_logging(verbose)
+    cfg = _build_config_from_options(
+        url=url,
+        target=target,
+        path=path,
+        client_mode=client_mode,
+        start_timeout=start_timeout,
+        embedded_receiver=embedded_receiver,
+        listen_host=listen_host,
+        listen_port=listen_port,
+        event_log_path=event_log_path,
+        enable_queue=enable_queue,
+        queue_backend=queue_backend,
+        queue_workers=queue_workers,
+        redis_url=redis_url,
+    )
+
+    if not getattr(cfg, "url", ""):
+        typer.secho("URL is required (SMEEME_URL or --url).", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    typer.echo("Sending test event…")
     try:
-        # Create temporary SmeeMe instance just for testing
-        smee = SmeeMe(config)
-        success = smee.send_test_event()
-        
-        if success:
-            print("Test event sent successfully!")
-            return 0
+        smee = SmeeMe(cfg)
+        ok = smee.send_test_event()
+        if ok:
+            typer.secho("✓ Test event sent", fg=typer.colors.GREEN)
+            raise typer.Exit(0)
         else:
-            print("Test event failed", file=sys.stderr)
-            return 1
-            
+            typer.secho("Test event failed", fg=typer.colors.RED)
+            raise typer.Exit(1)
     except SmeeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        typer.secho(f"Error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
-def cmd_status(args: argparse.Namespace, config: SmeeConfig) -> int:
-    """Show status (placeholder - would need shared state for real status)."""
-    print("Status command not yet implemented")
-    print("This would require a shared state mechanism between CLI and running instance")
-    return 0
+@app.command(no_args_is_help=True)
+def status(
+    url: Optional[str] = typer.Option(None, "--url", help="smee.io channel URL"),
+    target: Optional[str] = typer.Option(None, "--target", help="Target webhook URL"),
+    path: Optional[str] = typer.Option(None, "--path", help="Path appended to target"),
+    embedded_receiver: Optional[bool] = typer.Option(
+        None, "--embedded-receiver/--no-embedded-receiver", help="Enable embedded HTTP receiver"
+    ),
+    event_log_path: Optional[Path] = typer.Option(None, "--event-log-path", help="Path to log events as JSONL"),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity"),
+):
+    """Show effective configuration (local-only status)."""
+    _setup_logging(verbose)
+    cfg = _build_config_from_options(
+        url=url,
+        target=target,
+        path=path,
+        client_mode=None,
+        start_timeout=None,
+        embedded_receiver=embedded_receiver,
+        listen_host=None,
+        listen_port=None,
+        event_log_path=event_log_path,
+        enable_queue=None,
+        queue_backend=None,
+        queue_workers=None,
+        redis_url=None,
+    )
+
+    typer.echo("Effective configuration:")
+    typer.echo("-" * 40)
+    dump = cfg.model_dump() if hasattr(cfg, "model_dump") else cfg.dict()
+    for k, v in dump.items():
+        typer.echo(f"{k}: {v}")
 
 
-def cmd_config(args: argparse.Namespace, config: SmeeConfig) -> int:
-    """Show configuration."""
-    print("Current Configuration:")
-    print("=" * 40)
-    
-    config_dict = config.model_dump()
-    for key, value in config_dict.items():
-        print(f"{key}: {value}")
-    
-    if args.validate:
-        print("\nValidating configuration...")
+@app.command(no_args_is_help=True)
+def config(
+    validate: bool = typer.Option(False, "--validate", help="Validate configuration and runtime"),
+    url: Optional[str] = typer.Option(None, "--url", help="smee.io channel URL"),
+    target: Optional[str] = typer.Option(None, "--target", help="Target webhook URL"),
+    path: Optional[str] = typer.Option(None, "--path", help="Path appended to target"),
+    client_mode: Optional[ClientMode] = typer.Option(None, "--client-mode", help="auto|smee|npx"),
+    start_timeout: Optional[float] = typer.Option(None, "--start-timeout", help="Startup timeout (seconds)"),
+    embedded_receiver: Optional[bool] = typer.Option(
+        None, "--embedded-receiver/--no-embedded-receiver", help="Enable embedded HTTP receiver"
+    ),
+    listen_host: Optional[str] = typer.Option(None, "--listen-host", help="Embedded receiver host"),
+    listen_port: Optional[int] = typer.Option(None, "--listen-port", help="Embedded receiver port (0=auto)"),
+    event_log_path: Optional[Path] = typer.Option(None, "--event-log-path", help="Path to log events as JSONL"),
+    enable_queue: Optional[bool] = typer.Option(None, "--enable-queue/--no-enable-queue", help="Enable workflow queue"),
+    queue_backend: Optional[QueueBackend] = typer.Option(None, "--queue-backend", help="memory|redis"),
+    queue_workers: Optional[int] = typer.Option(None, "--queue-workers", help="Number of queue workers"),
+    redis_url: Optional[str] = typer.Option(None, "--redis-url", help="Redis URL (if queue-backend=redis)"),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity"),
+):
+    """Show effective configuration; optionally validate."""
+    _setup_logging(verbose)
+    cfg = _build_config_from_options(
+        url=url,
+        target=target,
+        path=path,
+        client_mode=client_mode,
+        start_timeout=start_timeout,
+        embedded_receiver=embedded_receiver,
+        listen_host=listen_host,
+        listen_port=listen_port,
+        event_log_path=event_log_path,
+        enable_queue=enable_queue,
+        queue_backend=queue_backend,
+        queue_workers=queue_workers,
+        redis_url=redis_url,
+    )
+
+    typer.echo("Current Configuration")
+    typer.echo("=" * 40)
+    dump = cfg.model_dump() if hasattr(cfg, "model_dump") else cfg.dict()
+    for k, v in dump.items():
+        typer.echo(f"{k}: {v}")
+
+    if validate:
+        typer.echo("\nValidating configuration…")
         try:
-            from .config import ConfigValidator
-            ConfigValidator.validate_config(config)
-            print("✓ Configuration is valid")
-            
-            # Check runtime requirements
-            warnings = ConfigValidator.check_runtime_requirements(config)
+            from .config import ConfigValidator  # optional helper
+
+            ConfigValidator.validate_config(cfg)
+            typer.secho("✓ Configuration is valid", fg=typer.colors.GREEN)
+            warnings = []
+            if hasattr(ConfigValidator, "check_runtime_requirements"):
+                warnings = ConfigValidator.check_runtime_requirements(cfg)
             if warnings:
-                print("\nWarnings:")
-                for warning in warnings:
-                    print(f"⚠ {warning}")
-            
+                typer.echo("\nWarnings:")
+                for w in warnings:
+                    typer.secho(f"  • {w}", fg=typer.colors.YELLOW)
         except Exception as e:
-            print(f"✗ Configuration validation failed: {e}")
-            return 1
-    
-    return 0
+            typer.secho(f"✗ Validation failed: {e}", fg=typer.colors.RED)
+            raise typer.Exit(1)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    """Main entry point."""
-    parser = create_parser()
-    args = parser.parse_args(argv)
-    
-    # Setup logging
-    setup_logging(args.verbose)
-    
-    # Load configuration
-    try:
-        config = load_configuration(args)
-    except Exception as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
-        return 1
-    
-    # Handle commands
-    if args.command == "start" or not args.command:
-        return cmd_start(args, config)
-    elif args.command == "test":
-        return cmd_test(args, config)
-    elif args.command == "status":
-        return cmd_status(args, config)
-    elif args.command == "config":
-        return cmd_config(args, config)
-    else:
-        parser.print_help()
-        return 1
+# --------------------------- entrypoint ---------------------------
+
+
+def main() -> None:
+    app()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() or 0)

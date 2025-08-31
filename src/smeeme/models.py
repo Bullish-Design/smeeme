@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, computed_field, field_validator, model_va
 
 class SmeeEvent(BaseModel):
     """Represents an event received from smee.io."""
+
     model_config = ConfigDict(extra="forbid")
 
     timestamp: float = Field(description="Event timestamp")
@@ -22,6 +23,7 @@ class SmeeEvent(BaseModel):
     source_ip: Optional[str] = Field(default=None, description="Source IP address")
     forwarded: bool = Field(default=False, description="Whether event was forwarded")
     error: Optional[str] = Field(default=None, description="Error message if forwarding failed")
+    receiver_port: Optional[int] = Field(default=None, description="Port that received the event")
 
     @computed_field
     @property
@@ -72,6 +74,7 @@ class SmeeEvent(BaseModel):
 
 class WorkflowPriority(Enum):
     """Priority levels for workflow jobs."""
+
     LOW = 1
     NORMAL = 2
     HIGH = 3
@@ -80,6 +83,7 @@ class WorkflowPriority(Enum):
 
 class WorkflowJob(BaseModel):
     """Queued workflow job."""
+
     model_config = ConfigDict(extra="forbid")
 
     job_id: str = Field(description="Unique job identifier")
@@ -106,15 +110,17 @@ class WorkflowJob(BaseModel):
 
 class QueueBackend(Enum):
     """Available queue backends."""
+
     MEMORY = "memory"
     REDIS = "redis"
 
 
 class SmeeStatus(BaseModel):
     """Status information for smee client."""
+
     model_config = ConfigDict(extra="forbid")
 
-    running: bool = Field(description="Whether smee client is running")
+    running: bool = Field(default=False, description="Whether smee client is running")
     process_id: Optional[int] = Field(default=None, description="Process ID if running")
     uptime_seconds: Optional[float] = Field(default=None, description="Uptime in seconds")
     restart_count: int = Field(default=0, description="Number of restarts")
@@ -122,6 +128,8 @@ class SmeeStatus(BaseModel):
     events_received: int = Field(default=0, description="Total events received")
     events_forwarded: int = Field(default=0, description="Events successfully forwarded")
     queue_size: int = Field(default=0, description="Current queue size")
+    receiver_port: Optional[int] = Field(default=None, description="Embedded receiver port")
+    receiver_running: bool = Field(default=False, description="Whether embedded receiver is running")
 
     @computed_field
     @property
@@ -140,6 +148,7 @@ class SmeeStatus(BaseModel):
 
 class SmeeMetrics(BaseModel):
     """Metrics for monitoring SmeeMe performance."""
+
     model_config = ConfigDict(extra="forbid")
 
     total_events: int = Field(default=0, description="Total events processed")
@@ -149,6 +158,8 @@ class SmeeMetrics(BaseModel):
     queue_jobs_failed: int = Field(default=0, description="Queue jobs failed")
     average_processing_time_ms: float = Field(default=0.0, description="Average processing time")
     uptime_seconds: float = Field(default=0.0, description="Total uptime")
+    events_logged: int = Field(default=0, description="Events logged to file")
+    events_forwarded_to_target: int = Field(default=0, description="Events forwarded to original target")
 
     @computed_field
     @property
@@ -178,6 +189,7 @@ class SmeeMetrics(BaseModel):
 
 class SmeeClientMode(Enum):
     """Available smee client modes."""
+
     AUTO = "auto"
     SMEE = "smee"
     NPX = "npx"
@@ -185,6 +197,7 @@ class SmeeClientMode(Enum):
 
 class LogLevel(Enum):
     """Logging levels."""
+
     DEBUG = "debug"
     INFO = "info"
     WARNING = "warning"
@@ -193,11 +206,12 @@ class LogLevel(Enum):
 
 class SmeeConfig(BaseModel):
     """Configuration for SmeeMe."""
+
     model_config = ConfigDict(extra="ignore")
 
     # Required settings
     url: str = Field(description="https://smee.io/<channel>")
-    target: str = Field(description="Where to forward deliveries, e.g., http://localhost:8000/webhook")
+    target: str = Field(default="", description="Where to forward deliveries, e.g., http://localhost:8000/webhook")
 
     # Client settings
     client_mode: SmeeClientMode = Field(default=SmeeClientMode.AUTO, description="Smee client mode")
@@ -209,6 +223,12 @@ class SmeeConfig(BaseModel):
     log_prefix: str = Field(default="[smee]", description="Log message prefix")
     capture_stdout: bool = Field(default=True, description="Capture subprocess stdout")
     capture_stderr: bool = Field(default=True, description="Capture subprocess stderr")
+
+    # Embedded receiver settings
+    embedded_receiver: bool = Field(default=True, description="Enable embedded HTTP receiver")
+    listen_host: str = Field(default="127.0.0.1", description="Embedded receiver host")
+    listen_port: int = Field(default=0, description="Embedded receiver port (0 = auto)")
+    event_log_path: Optional[Path] = Field(default=None, description="Path to log events as JSONL")
 
     # Queue settings
     enable_queue: bool = Field(default=False, description="Enable workflow queue")
@@ -236,11 +256,10 @@ class SmeeConfig(BaseModel):
     @classmethod
     def validate_target(cls, v: str) -> str:
         """Validate target URL."""
-        if not v:
-            raise ValueError("Target is required")
-        parsed = urlparse(v)
-        if not parsed.scheme or not parsed.netloc:
-            raise ValueError("Target must be a valid URL")
+        if v and v.strip():  # Only validate if target is provided
+            parsed = urlparse(v)
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError("Target must be a valid URL")
         return v
 
     @computed_field
@@ -259,9 +278,16 @@ class SmeeConfig(BaseModel):
             return f"{base}{path_part}"
         return self.target
 
+    @computed_field
+    @property
+    def webhook_path(self) -> str:
+        """Get webhook path for embedded receiver."""
+        return self.path or "/webhook"
+
 
 class WorkflowConfig(BaseModel):
     """Configuration for workflow processing."""
+
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(description="Workflow name")
